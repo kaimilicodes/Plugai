@@ -1,0 +1,993 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body><title>Plug AI Script Library</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@600;700&family=IBM+Plex+Mono:wght@400;500&family=Manrope:wght@400;500;600;700&display=swap">
+<style>
+/* Layout: one column. Header, brand tag, deck controls (new script / reset), script picker, then the chosen script in three blocks: conversation, narrator lines, caption. */
+:root {
+  --bg: #11131A;
+  --surface: #191C26;
+  --surface-2: #212534;
+  --line: #2B3042;
+  --fg: #E9E7E2;
+  --muted: #9AA1B2;
+  --accent: #C9A96B;
+  --accent-ink: #14110A;
+  --her: #AEB4C4;
+  --me: #C9A96B;
+  --ok: #7FC8A0;
+  --display: 'Bricolage Grotesque', 'Segoe UI', sans-serif;
+  --body: 'Manrope', 'Segoe UI', system-ui, sans-serif;
+  --mono: 'IBM Plex Mono', ui-monospace, Menlo, Consolas, monospace;
+  color-scheme: dark;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg: #EEF0F4; --surface: #FFFFFF; --surface-2: #F3F4F8; --line: #D8DCE6;
+    --fg: #171A22; --muted: #596073; --accent: #7A5A12; --accent-ink: #FFFFFF;
+    --her: #4B5266; --me: #7A5A12; --ok: #1F7A4D; color-scheme: light;
+  }
+}
+:root[data-theme="light"] {
+  --bg: #EEF0F4; --surface: #FFFFFF; --surface-2: #F3F4F8; --line: #D8DCE6;
+  --fg: #171A22; --muted: #596073; --accent: #7A5A12; --accent-ink: #FFFFFF;
+  --her: #4B5266; --me: #7A5A12; --ok: #1F7A4D; color-scheme: light;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--bg); color: var(--fg); font-family: var(--body); font-size: 16px; line-height: 1.5;
+  padding-block: 32px 64px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+.wrap { max-width: 860px; margin: 0 auto; display: flex; flex-direction: column; gap: 28px; }
+h1 { font-family: var(--display); font-weight: 700; font-size: clamp(30px, 6vw, 44px); line-height: 1.05; margin: 0; letter-spacing: -0.01em; text-wrap: balance; }
+h2 { font-family: var(--display); font-weight: 600; font-size: 22px; margin: 0; }
+p { margin: 0; }
+.lede { color: var(--muted); max-width: 60ch; margin-top: 10px; }
+header { display: flex; flex-direction: column; }
+.tools { display: flex; flex-wrap: wrap; gap: 12px 20px; align-items: end; padding: 16px; background: var(--surface); border: 1px solid var(--line); border-radius: 12px; }
+.field { display: flex; flex-direction: column; gap: 6px; min-width: 0; flex: 1 1 220px; }
+.field label { font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+.field input { font: inherit; font-family: var(--mono); font-size: 15px; background: var(--surface-2); color: var(--fg); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; min-width: 0; }
+.field input:focus-visible, button:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.hint { font-size: 13px; color: var(--muted); flex: 2 1 260px; }
+.deck { display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: center; }
+.deck .status { font-family: var(--mono); font-size: 13px; color: var(--muted); flex: 1 1 200px; }
+.deck .status b { color: var(--fg); font-weight: 500; }
+.picker { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; }
+.pick { text-align: left; font: inherit; color: var(--fg); background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; cursor: pointer; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.pick .tag { font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); font-weight: 700; display: flex; justify-content: space-between; gap: 8px; }
+.pick .hk { font-size: 15px; font-weight: 600; line-height: 1.3; }
+.pick.used { opacity: 0.62; }
+.pick[aria-pressed="true"] { border-color: var(--accent); background: var(--surface-2); opacity: 1; }
+.pick[aria-pressed="true"] .tag { color: var(--accent); }
+.count { display: flex; flex-wrap: wrap; gap: 8px 18px; font-family: var(--mono); font-size: 13px; color: var(--muted); }
+.count b { color: var(--fg); font-weight: 500; }
+section.block { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 20px; display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.head { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; justify-content: space-between; }
+.head p { color: var(--muted); font-size: 14px; flex: 1 1 260px; }
+.btn { font: inherit; font-weight: 700; font-size: 14px; background: var(--accent); color: var(--accent-ink); border: 0; border-radius: 8px; padding: 10px 16px; cursor: pointer; white-space: nowrap; }
+.btn.small { padding: 6px 11px; font-size: 13px; background: var(--surface-2); color: var(--fg); border: 1px solid var(--line); font-weight: 600; }
+.btn.ghost { background: transparent; color: var(--fg); border: 1px solid var(--line); }
+.btn.done { background: var(--ok); color: #0B1A12; border-color: transparent; }
+.convo { font-family: var(--mono); font-size: 14px; line-height: 1.65; background: var(--surface-2); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; display: flex; flex-direction: column; gap: 2px; overflow-wrap: anywhere; }
+.convo .her b { color: var(--her); font-weight: 500; }
+.convo .me b { color: var(--me); font-weight: 500; }
+ol.nar { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+ol.nar li { display: grid; grid-template-columns: 1fr auto; gap: 8px 12px; align-items: start; padding: 12px 14px; background: var(--surface-2); border: 1px solid var(--line); border-radius: 10px; }
+ol.nar .when { grid-column: 1 / -1; font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); font-weight: 600; overflow-wrap: anywhere; }
+ol.nar .when em { font-style: normal; font-family: var(--mono); text-transform: none; letter-spacing: 0; color: var(--fg); font-weight: 400; font-size: 13px; }
+ol.nar .txt { font-weight: 600; min-width: 0; overflow-wrap: anywhere; }
+ol.nar li.marker { background: transparent; border-style: dashed; color: var(--muted); font-size: 14px; display: block; }
+.caption { font-family: var(--mono); font-size: 14px; background: var(--surface-2); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; overflow-wrap: anywhere; }
+details.share { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 0 20px; }
+details.share summary { cursor: pointer; padding: 16px 0; font-family: var(--display); font-weight: 600; font-size: 18px; }
+details.share .body { display: flex; flex-direction: column; gap: 12px; padding-bottom: 18px; color: var(--muted); font-size: 15px; }
+details.share ol { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 6px; }
+details.share b { color: var(--fg); font-weight: 600; }
+footer { color: var(--muted); font-size: 13px; }
+@media (max-width: 520px) { section.block { padding: 16px; } ol.nar li { grid-template-columns: 1fr; } .btn.small { justify-self: start; } }
+@media (prefers-reduced-motion: no-preference) { .pick, .btn { transition: border-color .15s, background .15s; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <h1>Plug AI Script Library</h1>
+    <p class="lede">Hit New script for the next one. Copy the conversation in one tap and paste it into your chat tool, then add the narrator lines on your reaction pictures where the list says.</p>
+  </header>
+
+  <div class="tools">
+    <div class="field">
+      <label for="brand">Brand hashtag</label>
+      <input id="brand" type="text" placeholder="#yourbrandtag" autocomplete="off" spellcheck="false">
+    </div>
+    <p class="hint">Whatever you type here is added to the end of every caption below.</p>
+  </div>
+
+  <div class="deck">
+    <button class="btn" id="next" type="button">New script</button>
+    <button class="btn ghost" id="reset" type="button">Reset deck</button>
+    <p class="status" id="status" aria-live="polite"></p>
+  </div>
+
+  <div class="picker" id="picker" role="group" aria-label="All scripts"></div>
+
+  <div class="count" id="count"></div>
+
+  <section class="block" aria-labelledby="h-convo">
+    <div class="head">
+      <h2 id="h-convo">1. Full conversation</h2>
+      <button class="btn" id="copy-convo" type="button">Copy conversation</button>
+    </div>
+    <div class="convo" id="convo"></div>
+  </section>
+
+  <section class="block" aria-labelledby="h-nar">
+    <div class="head">
+      <h2 id="h-nar">2. Narrator lines</h2>
+      <button class="btn" id="copy-nar" type="button">Copy all lines</button>
+    </div>
+    <p>Each line goes on a reaction picture. It says which text it comes after, so you know where to put it.</p>
+    <ol class="nar" id="nar"></ol>
+  </section>
+
+  <section class="block" aria-labelledby="h-cap">
+    <div class="head">
+      <h2 id="h-cap">3. Caption</h2>
+      <button class="btn" id="copy-cap" type="button">Copy caption</button>
+    </div>
+    <div class="caption" id="cap"></div>
+  </section>
+
+  <details class="share" id="share">
+    <summary>Put this page online for free, so friends can use it</summary>
+    <div class="body">
+      <p>This page is one file, so any free static host can serve it. GitHub Pages is the simplest to do from a phone or laptop.</p>
+      <div><button class="btn" id="copy-page" type="button">Copy the page file</button></div>
+      <ol>
+        <li>Tap <b>Copy the page file</b> above.</li>
+        <li>On github.com, make a free account and create a <b>new repository</b>. Name it anything and set it to public.</li>
+        <li>Choose <b>Add file, then Create new file</b>. Name it <b>index.html</b> and paste what you copied.</li>
+        <li>Commit it. Then open <b>Settings, then Pages</b>, set the source to the main branch, and save.</li>
+        <li>After a minute GitHub shows your link. Send it to your friends.</li>
+      </ol>
+      <p>Netlify Drop and Cloudflare Pages also work: save the copied text as index.html and drag that file onto them. Everyone's brand hashtag and deck progress are saved in their own browser only.</p>
+    </div>
+  </details>
+
+  <footer>Write your own caption wording if you reuse a script, and keep the tag @plug_ai in it.</footer>
+</div>
+
+<script>
+var CTA = "Search Plug AI on the App Store & Play Store\n@plug_ai";
+var TAGS = "#darkpsychology #psychology #48lawsofpower #mindgames";
+var AFTER = [0, 2, 4, 5, 6, 8, 10, 12, 14, 16];
+
+var SCRIPTS = [
+  {
+    tag: "Silent treatment",
+    lines: [
+      "her: hey stranger. so you're alive",
+      "me: yeah. busy week",
+      "her: busy? I saw you online yesterday and you couldn't text me for 10 seconds",
+      "me: I could have",
+      "her: I went quiet for two days and you didn't even ask if I was okay. that says a lot about how much you care",
+      "me: I noticed you needed space, so I gave you space. Caring doesn't mean chasing. I'm here now, so what's going on?",
+      "her: that's not fair. I wanted you to reach out",
+      "me: and I wanted you to say that instead of waiting two days",
+      "her: whatever. Jake invited me to his place tonight. just saying",
+      "me: sounds fun. you already decided to go, so what do you want me to add",
+      "her: you don't even care if I go?",
+      "me: I care that you're honest with me. where you go is your call",
+      "her: ok I'm not going. you're so annoying when you're this calm",
+      "me: I want you. I don't need you to prove it",
+      "her: I'm sorry. I shouldn't have tested you",
+      "me: thank you for saying that. we're okay if the silent treatment stays in the past",
+      "her: deal. I miss you",
+      "me: I know. come over Friday and I'll tell you the rest"
+    ],
+    nar: [
+      "She went silent to make me chase. I didn't.",
+      "Three days of silence. Then this.",
+      "She was setting up a guilt trip.",
+      "I wanted to see what she was really doing.",
+      "I didn't take the bait.",
+      "Then she tried jealousy.",
+      "I let her have her plans.",
+      "She expected me to react.",
+      "She noticed I wasn't playing.",
+      "She regretted testing me."
+    ],
+    caption: "she went silent to make me chase. @plug_ai read it before I replied"
+  },
+  {
+    tag: "Jealousy test",
+    lines: [
+      "her: so I went out with Marcus last night",
+      "me: nice. did you have fun",
+      "her: that's it? no questions?",
+      "me: you told me because you wanted me to know. I'm glad you did",
+      "her: you're not even a little jealous? most guys would be",
+      "me: I'm curious why it mattered so much that I reacted. I trust you, and I'd rather talk about what you actually want",
+      "her: ugh. you're impossible to read",
+      "me: I'm easy to read. you just keep expecting a different answer",
+      "her: I just thought you'd care more",
+      "me: I care enough not to turn it into a contest",
+      "her: ok fine. Marcus is a coworker. I wanted to see your reaction",
+      "me: I figured. thanks for being honest now",
+      "her: you're not mad?",
+      "me: no. I'd rather we ask each other things directly",
+      "her: deal. next time I'll just ask",
+      "me: that works for me",
+      "her: so what are you doing Friday",
+      "me: dinner with you, if you ask properly"
+    ],
+    nar: [
+      "She tried to make me jealous. I got curious instead.",
+      "She dropped his name on purpose.",
+      "She wanted a reaction.",
+      "I wanted to see what she was really doing.",
+      "I didn't take the bait.",
+      "She tried a different angle.",
+      "I refused to compete.",
+      "She admitted the test.",
+      "She dropped the game.",
+      "She regretted testing me."
+    ],
+    caption: "she tried to make me jealous. @plug_ai helped me stay curious instead"
+  },
+  {
+    tag: "Breadcrumbing",
+    lines: [
+      "her: heyyy stranger",
+      "me: hey. what's up",
+      "her: nothing, was just thinking about you",
+      "me: that's nice. you've been quiet for a week",
+      "her: I know, I've been so busy. we should hang out soon",
+      "me: soon is vague. I'm free Thursday if you want a real plan",
+      "her: Thursday is tough. maybe next week?",
+      "me: maybe isn't a plan, but I'll be around",
+      "her: don't be like that",
+      "me: I'm not being like anything. I just like plans more than promises",
+      "her: wow okay. I do like you, you know",
+      "me: I believe you. I also believe actions, and so far it's mostly been messages",
+      "her: that's harsh",
+      "me: it's honest. I enjoy talking to you, and I want to see you, not just text",
+      "her: ok Thursday. I'll make it work",
+      "me: great. tell me the time and place and I'm there",
+      "her: 7? I'll send the address",
+      "me: perfect. see you then"
+    ],
+    nar: [
+      "She kept me on the hook with maybes. I asked for a plan.",
+      "Out of nowhere, a text.",
+      "I noticed the pattern.",
+      "I wanted to see what she was really doing.",
+      "I asked for a plan instead.",
+      "She tried to soften it.",
+      "I held my line.",
+      "She felt the shift.",
+      "Maybe turned into a time.",
+      "She stopped hiding behind maybes."
+    ],
+    caption: "she kept saying maybe. @plug_ai helped me ask for a plan"
+  },
+  {
+    tag: "Love-bombing",
+    lines: [
+      "her: I've never felt this way about anyone",
+      "me: that's sweet. we've only known each other a few days though",
+      "her: when you know, you know",
+      "me: sometimes. I'd like to know you a bit longer first",
+      "her: I already know you're the one. I told my friends about us",
+      "me: I'm flattered. I want to take this slow so it's real, not just intense",
+      "her: so you don't feel the same way",
+      "me: I feel good about us. feeling good and feeling certain take different amounts of time",
+      "her: it feels like you're pulling away",
+      "me: I'm not pulling away. I'm just not rushing",
+      "her: I'd do anything for you. why can't you do the same",
+      "me: I'm doing what I can honestly do right now, which is show up and be consistent",
+      "her: ok. I guess I'm just excited",
+      "me: I like that you're excited. I'd like us to enjoy this without a deadline",
+      "her: you're right. sorry for coming on strong",
+      "me: no need to apologize. thanks for saying that",
+      "her: dinner Saturday?",
+      "me: yes. I'll pick the place"
+    ],
+    nar: [
+      "She said I love you after three days. I slowed it down.",
+      "Day three. She'd already picked a future.",
+      "Too much, too fast.",
+      "I wanted to see what she was really doing.",
+      "I stayed warm, and I slowed it down.",
+      "Then it turned into a test.",
+      "She read my pace as distance.",
+      "I kept my answer simple.",
+      "She felt the pressure ease.",
+      "Slow turned out to be better."
+    ],
+    caption: "she said I love you after three days. @plug_ai helped me keep the pace steady"
+  },
+  {
+    tag: "We need to talk",
+    lines: [
+      "her: we need to talk",
+      "me: sure. what about",
+      "her: not over text",
+      "me: ok. tell me when you're free and I'll make time",
+      "her: you're being weirdly calm. I don't like it",
+      "me: I'd rather stay calm and hear what's on your mind than guess. what's going on",
+      "her: it's about how you've been acting lately",
+      "me: which part? I'd like to understand it properly",
+      "her: you've been distant",
+      "me: I've been busy, and I could have said so. thanks for telling me",
+      "her: so you're not mad",
+      "me: not at all. is that what the talk was about",
+      "her: kind of. I thought you were losing interest",
+      "me: I'm not. I'd rather you ask me than assume",
+      "her: ok. I'm sorry I made it sound so serious",
+      "me: it's fine. I'm glad we talked",
+      "her: can we get food tonight",
+      "me: yes. you pick"
+    ],
+    nar: [
+      "She texted we need to talk. I asked her to be specific.",
+      "Four words. No context.",
+      "She wanted me to panic.",
+      "I wanted to see what she was really doing.",
+      "I asked questions instead of reacting.",
+      "She stopped being vague.",
+      "I didn't explain myself.",
+      "The big talk got small.",
+      "It was never really that serious.",
+      "Calm ended the game."
+    ],
+    caption: "she texted we need to talk. @plug_ai helped me stay calm and ask the right questions"
+  },
+  {
+    tag: "Hot and cold",
+    lines: [
+      "her: good morning!! I missed you",
+      "me: good morning. missed you too",
+      "her: yesterday was so fun, can't stop smiling",
+      "me: same. you made my week",
+      "her: ok but I'm super busy now, talk later",
+      "me: no problem. I'll be around, and I'll reply when I can",
+      "her: wow that was a cold reply",
+      "me: it was a calm reply. you said you were busy",
+      "her: yesterday you were all over me, today it's different",
+      "me: yesterday you were all over me too. I'm just following your pace",
+      "her: so you're copying me",
+      "me: I'm meeting you where you are. if you want more, tell me",
+      "her: I want you to try harder",
+      "me: I'll gladly show up. I won't chase someone who keeps changing the pace",
+      "her: that's fair. I've been inconsistent",
+      "me: thanks for saying it. consistency works for me",
+      "her: ok. call me tonight",
+      "me: 8 works"
+    ],
+    nar: [
+      "She was hot one day and cold the next. I stayed steady.",
+      "Warm morning. Warm reply.",
+      "She was all in.",
+      "I wanted to see what she was really doing.",
+      "I didn't follow the swing.",
+      "She noticed my calm.",
+      "I matched her pace.",
+      "She accused me of copying.",
+      "I stayed steady.",
+      "She admitted it."
+    ],
+    caption: "hot one day, cold the next. @plug_ai helped me stay steady"
+  },
+  {
+    tag: "Ghost returns",
+    lines: [
+      "her: hey you",
+      "me: hey. it's been a while",
+      "her: I know, life got crazy",
+      "me: I figured",
+      "her: I've been thinking about you a lot. I miss talking to you",
+      "me: I'm glad you're doing well. I missed the chats too, but I need consistency from people I talk to. what changed",
+      "her: I got overwhelmed. I'm sorry",
+      "me: thanks for saying that. what do you want now",
+      "her: to pick up where we left off",
+      "me: we can't pick up from silence. we can start fresh and see how it goes",
+      "her: so you're mad at me",
+      "me: not mad. just more careful than before",
+      "her: that's fair. what if I call you this weekend",
+      "me: I'd like that, if you call",
+      "her: I will. promise",
+      "me: great. I'll hold you to the call, not the promise",
+      "her: ha. fair. Saturday at 6?",
+      "me: Saturday at 6 works"
+    ],
+    nar: [
+      "She ghosted me for three weeks. Then she said hey.",
+      "Three weeks of nothing. Then a text.",
+      "She acted like no time had passed.",
+      "I wanted to see what she was really doing.",
+      "I stayed warm, not eager.",
+      "She asked for a reset.",
+      "I didn't hand it over.",
+      "She heard the difference.",
+      "I asked for action, not promises.",
+      "She had to show up."
+    ],
+    caption: "she ghosted me for three weeks, then said hey. @plug_ai helped me answer without chasing"
+  },
+  {
+    tag: "Cancelled plans",
+    lines: [
+      "her: omg I'm so sorry, I can't make tonight",
+      "me: no worries. what happened",
+      "her: just really tired. can we do next week?",
+      "me: sure. this is the third time though",
+      "her: you're making me feel guilty. I'm literally exhausted",
+      "me: I'm not trying to make you feel guilty. I get being tired. I'd just rather you tell me when you actually want to plan something, and I'll be there",
+      "her: I do want to see you",
+      "me: good. then pick a day you're sure about",
+      "her: I don't know yet",
+      "me: ok. let me know when you do",
+      "her: that's it? you're not going to push?",
+      "me: no. I'd rather you come to me when you're ready",
+      "her: ok wow. what about Thursday",
+      "me: Thursday works if you confirm Thursday morning",
+      "her: deal. I'll text you at 9",
+      "me: perfect",
+      "her: and I'll pick the place this time",
+      "me: sounds good"
+    ],
+    nar: [
+      "She cancelled on me three times. I stopped rescheduling.",
+      "Another cancellation.",
+      "I had been counting quietly.",
+      "I wanted to see what she was really doing.",
+      "I stayed kind and clear.",
+      "She wanted me to chase a date.",
+      "I put the choice back on her.",
+      "She expected a push.",
+      "I waited. She came back.",
+      "She made the plan herself."
+    ],
+    caption: "third cancelled plan. @plug_ai helped me put the choice back on her"
+  },
+  {
+    tag: "Ultimatum",
+    lines: [
+      "her: where are you",
+      "me: at the gym. what's up",
+      "her: you've been on your phone all day and haven't texted me",
+      "me: I've been busy",
+      "her: reply within 10 minutes next time or I'm done",
+      "me: I want to talk, but I don't respond well to deadlines. tell me what's bothering you and I'll answer properly",
+      "her: I just feel ignored",
+      "me: that's useful to know. I wasn't ignoring you, I was busy. I can text you more during the day",
+      "her: I don't want to feel like I'm begging",
+      "me: you don't have to beg. you can just ask me",
+      "her: ok. can you text me during lunch",
+      "me: yes. I'll text you at 1",
+      "her: really?",
+      "me: really. I like it when you tell me straight",
+      "her: sorry about the ten minutes thing",
+      "me: it's fine. just say it directly next time",
+      "her: ok. what are you doing after the gym",
+      "me: dinner with you, if you want"
+    ],
+    nar: [
+      "She gave me ten minutes to reply. I took twenty.",
+      "A countdown, out of nowhere.",
+      "She started with pressure.",
+      "I wanted to see what she was really doing.",
+      "I didn't take the deadline.",
+      "The pressure turned into a feeling.",
+      "I answered the feeling.",
+      "She stopped demanding.",
+      "She asked directly.",
+      "Honesty beat the deadline."
+    ],
+    caption: "she gave me ten minutes to reply. @plug_ai helped me answer the feeling, not the deadline"
+  },
+  {
+    tag: "Ex talk",
+    lines: [
+      "her: I ran into my ex today",
+      "me: oh yeah? how was that",
+      "her: weird. he said I look good",
+      "me: you do",
+      "her: that's it? you're not bothered he's still into me?",
+      "me: I'm not bothered. he's your past. I'm more interested in what you want now",
+      "her: ugh. why are you so calm",
+      "me: because I don't have anything to prove",
+      "her: most guys would ask a million questions",
+      "me: I'd rather ask one. do you want to be with him",
+      "her: no. obviously not",
+      "me: good. then we're fine",
+      "her: I just wanted to see if you'd care",
+      "me: I care. I just don't need a test to show it",
+      "her: ok that's sweet",
+      "me: I mean it",
+      "her: so are we still on for Friday",
+      "me: absolutely"
+    ],
+    nar: [
+      "She brought up her ex to see how I'd react.",
+      "She dropped a name.",
+      "She wanted a reaction.",
+      "I wanted to see what she was really doing.",
+      "I didn't flinch.",
+      "She tried to push harder.",
+      "I asked one question.",
+      "She admitted the test.",
+      "I answered with calm.",
+      "The ex stopped mattering."
+    ],
+    caption: "she brought up her ex to see my face. @plug_ai helped me stay curious"
+  },
+  {
+    tag: "Future faking",
+    lines: [
+      "her: we should totally go to Bali together this summer",
+      "me: that would be amazing",
+      "her: and then Paris next year!",
+      "me: you've got big plans",
+      "her: you're the person I want to do all of it with",
+      "me: I love hearing that. let's start small. are you free Friday night",
+      "her: um, I have a thing",
+      "me: ok. Saturday then",
+      "her: I'm not sure about Saturday either",
+      "me: no problem. I just like plans I can actually plan",
+      "her: you don't believe me about Bali",
+      "me: I believe you mean it. I'd like to see us do something this week first",
+      "her: ok that's fair",
+      "me: how about coffee Sunday",
+      "her: Sunday works",
+      "me: great. 11?",
+      "her: 11 is perfect",
+      "me: see you then"
+    ],
+    nar: [
+      "She planned our whole summer. I asked about Friday.",
+      "Big promises. No dates.",
+      "She painted a whole future.",
+      "I wanted to see what she was really doing.",
+      "I loved the vision. I asked about Friday.",
+      "The future got vague fast.",
+      "I stayed practical.",
+      "She felt called out, kindly.",
+      "Small plans first.",
+      "She got a date, not a dream."
+    ],
+    caption: "she planned our whole summer but not Friday. @plug_ai helped me keep it real"
+  },
+  {
+    tag: "Delayed reply",
+    lines: [
+      "her: hey",
+      "me: hey. you went quiet earlier",
+      "her: yeah I was busy",
+      "me: no worries",
+      "her: you've been so distant today",
+      "me: I texted you this morning and gave you space. I'm happy to talk now. what's up",
+      "her: you didn't text me all afternoon",
+      "me: you hadn't replied yet, so I figured you were busy",
+      "her: I was, but you could have checked on me",
+      "me: I could have. next time I'll send another text. I'd like the same from you",
+      "her: that's fair",
+      "me: I'm not keeping score. I just like balance",
+      "her: balance. ok",
+      "me: how was your day",
+      "her: long. tell me about yours",
+      "me: better now that you replied",
+      "her: you're sweet",
+      "me: call me when you're free"
+    ],
+    nar: [
+      "She took six hours to reply. Then I was the distant one.",
+      "Six hours of silence.",
+      "Then a complaint.",
+      "I wanted to see what she was really doing.",
+      "I didn't accept the blame.",
+      "She tried to shift it.",
+      "I stayed fair.",
+      "She heard the balance.",
+      "I kept it light.",
+      "She finally showed up."
+    ],
+    caption: "six hours to reply, then I was the distant one. @plug_ai helped me stay fair"
+  },
+  {
+    tag: "Comparison",
+    lines: [
+      "her: Mark texts me back instantly",
+      "me: good for Mark",
+      "her: just saying, he's very attentive",
+      "me: I'm glad he's attentive",
+      "her: you could learn something from him",
+      "me: if there's something you'd like from me, tell me directly and I'll see if I can do it. I'm not going to compete with Mark",
+      "her: you're no fun when you're like this",
+      "me: I'm happy to have fun. I just won't compete for your attention",
+      "her: I wasn't trying to start something",
+      "me: I know. you were trying to see what I'd do",
+      "her: ...maybe",
+      "me: that's okay. I'd rather you ask for what you want",
+      "her: ok. I want you to text me more",
+      "me: I can do that",
+      "her: really?",
+      "me: yes. you asked directly, so now I know",
+      "her: thank you",
+      "me: you're welcome. what are you up to tonight"
+    ],
+    nar: [
+      "She told me another guy texts back faster. I thanked her.",
+      "She brought up another guy.",
+      "She was holding up a mirror.",
+      "I wanted to see what she was really doing.",
+      "I refused to compete.",
+      "She called me boring.",
+      "I stayed warm.",
+      "She admitted the test.",
+      "She asked directly.",
+      "A direct ask got a direct answer."
+    ],
+    caption: "she told me about another guy on purpose. @plug_ai helped me not compete"
+  },
+  {
+    tag: "Moving goalposts",
+    lines: [
+      "her: you forgot to text me good morning",
+      "me: sorry. I'll send it tomorrow",
+      "her: and last night you texted late",
+      "me: I was working. I'll tell you earlier next time",
+      "her: I just feel like you never put in effort",
+      "me: I hear that. I've adjusted the last two things you asked. tell me what a good week looks like for you",
+      "her: I don't know. just more",
+      "me: more of what. give me one thing I can do",
+      "her: call me every night",
+      "me: I can do three nights a week. every night won't work with my schedule",
+      "her: three isn't enough",
+      "me: then we might want different things, and that's okay. let's figure out which",
+      "her: wait, I don't want that",
+      "me: ok. then let's agree on something realistic",
+      "her: four nights?",
+      "me: four works",
+      "her: thank you",
+      "me: thank you for being specific"
+    ],
+    nar: [
+      "Nothing I did was enough. So I asked what enough was.",
+      "Every complaint was a new rule.",
+      "The list kept growing.",
+      "I wanted to see what she was really doing.",
+      "I asked what enough looks like.",
+      "She couldn't name it.",
+      "I offered something real.",
+      "I told her the truth.",
+      "She backed down.",
+      "Clear beats endless."
+    ],
+    caption: "nothing was ever enough. @plug_ai helped me ask what enough looks like"
+  },
+  {
+    tag: "I'm fine",
+    lines: [
+      "her: I'm fine",
+      "me: ok. you don't sound fine",
+      "her: I said I'm fine",
+      "me: ok",
+      "her: you're not even going to ask what's wrong?",
+      "me: I asked once and you said you're fine. I'm here if you want to tell me, and I'm not going to guess",
+      "her: you should just know",
+      "me: I wish I could read minds. I can listen though",
+      "her: you didn't text me back yesterday",
+      "me: thank you for telling me. I was in meetings and didn't see it",
+      "her: I felt ignored",
+      "me: that makes sense. I'm sorry it felt that way",
+      "her: really?",
+      "me: yes. I'd rather hear it than guess",
+      "her: ok. I'm sorry I got short with you",
+      "me: no problem. thanks for opening up",
+      "her: can I call you",
+      "me: of course"
+    ],
+    nar: [
+      "She said I'm fine. She wasn't. I asked once.",
+      "Two words. Zero information.",
+      "She wanted me to guess.",
+      "I wanted to see what she was really doing.",
+      "I asked once. Then I waited.",
+      "She wanted me to read her mind.",
+      "I offered to listen.",
+      "The real issue came out.",
+      "I took the fair part.",
+      "She told me directly."
+    ],
+    caption: "she said I'm fine. @plug_ai helped me ask once and wait"
+  },
+  {
+    tag: "Late-night text",
+    lines: [
+      "her: you up?",
+      "me: morning. what's up",
+      "her: haha you ignored me last night",
+      "me: I was asleep",
+      "her: I was bored and wanted to talk. you always answer",
+      "me: I'm happy to talk at normal hours. I'm not available for 1 a.m. boredom",
+      "her: wow, harsh",
+      "me: it's honest. I like talking to you when you actually want to talk to me, not just when you're bored",
+      "her: I do want to talk to you",
+      "me: good. then call me tonight",
+      "her: you're not mad?",
+      "me: no. I just have boundaries",
+      "her: ok. I respect that",
+      "me: thank you",
+      "her: what time tonight",
+      "me: 8",
+      "her: it's a date",
+      "me: it's a date"
+    ],
+    nar: [
+      "She texted at 1 a.m. I answered at 9.",
+      "1 a.m. Two words.",
+      "I let it sit until morning.",
+      "I wanted to see what she was really doing.",
+      "I stayed warm and clear.",
+      "She called it harsh.",
+      "I told her what I actually wanted.",
+      "She stopped arguing.",
+      "I set the time.",
+      "A real plan beat a late-night text."
+    ],
+    caption: "1 a.m. text. @plug_ai helped me set a boundary without a fight"
+  },
+  {
+    tag: "Distance test",
+    lines: [
+      "her: I think we should take a step back",
+      "me: ok. what do you mean by that",
+      "her: I need space to figure some things out",
+      "me: that's fair",
+      "her: you're not going to try to change my mind?",
+      "me: I'd rather you decide freely. take the space you need, and I'll be here if you want to talk",
+      "her: you're being weirdly okay with this",
+      "me: I want you to be sure. I don't want to talk you into anything",
+      "her: what if I'm not sure",
+      "me: then take your time. I'm not going anywhere, but I'm also not going to wait forever",
+      "her: that's kind of intense",
+      "me: it's honest. I want clarity, not limbo",
+      "her: ok. give me a few days",
+      "me: a few days is fine",
+      "her: I'll text you Wednesday",
+      "me: ok. talk then",
+      "her: thank you for understanding",
+      "me: of course"
+    ],
+    nar: [
+      "She pulled away to see if I'd chase. I gave her space.",
+      "She wanted space.",
+      "I said okay.",
+      "I wanted to see what she was really doing.",
+      "I didn't try to talk her out of it.",
+      "She didn't expect that.",
+      "I let her choose freely.",
+      "I named my boundary.",
+      "She gave me a date.",
+      "Space worked both ways."
+    ],
+    caption: "she pulled away to see if I'd chase. @plug_ai helped me give her space"
+  },
+  {
+    tag: "You've changed",
+    lines: [
+      "her: you've changed",
+      "me: probably. how do you mean",
+      "her: you used to text me all day",
+      "me: I used to have more free time",
+      "her: it feels like you don't care anymore",
+      "me: I care. my schedule changed, and I should have told you. what would help you feel more connected",
+      "her: I don't know. just feeling like a priority",
+      "me: you're a priority. I'll show it more clearly",
+      "her: how",
+      "me: a call every evening, and a good morning text before work",
+      "her: that's actually nice",
+      "me: I also want to hear what you're willing to do on your side",
+      "her: I can plan one weekend date",
+      "me: great. pick a weekend",
+      "her: this one?",
+      "me: this one works",
+      "her: yay",
+      "me: yay"
+    ],
+    nar: [
+      "She said I've changed. I agreed.",
+      "Three words. A lot of weight.",
+      "She wanted me defensive.",
+      "I wanted to see what she was really doing.",
+      "I agreed and asked for details.",
+      "She had no real list.",
+      "I offered specifics.",
+      "I asked for her half.",
+      "She found her side.",
+      "Balance beat blame."
+    ],
+    caption: "she said I've changed. @plug_ai helped me agree and get specific"
+  }
+];
+
+var cur = 0;
+var used = [];
+var brandEl = document.getElementById('brand');
+
+function store(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+function load(k) { try { return localStorage.getItem(k) || ''; } catch (e) { return ''; } }
+
+function copyText(text, btn) {
+  var label = btn.getAttribute('data-label') || btn.textContent;
+  btn.setAttribute('data-label', label);
+  function ok() { btn.textContent = 'Copied'; btn.classList.add('done'); setTimeout(function () { btn.textContent = label; btn.classList.remove('done'); }, 1400); }
+  function fallback() {
+    var ta = document.createElement('textarea');
+    ta.value = text; ta.setAttribute('readonly', ''); ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    var good = false;
+    try { good = document.execCommand('copy'); } catch (e) {}
+    document.body.removeChild(ta);
+    if (good) { ok(); } else { btn.textContent = 'Select and copy manually'; setTimeout(function () { btn.textContent = label; }, 2200); }
+  }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(ok, fallback);
+  } else { fallback(); }
+}
+
+function brandTag() {
+  var b = brandEl.value.trim().replace(/^#+/, '').replace(/\s+/g, '');
+  return b ? ' #' + b : '';
+}
+function captionText(s) { return s.caption + ' ' + TAGS + brandTag(); }
+
+function narrationList(s) {
+  var out = [];
+  for (var i = 0; i < s.nar.length; i++) {
+    var line = s.nar[i];
+    if (AFTER[i] === 0) out.push('Before the chat starts: ' + line);
+    else out.push('After "' + s.lines[AFTER[i] - 1] + '": ' + line);
+  }
+  out.push('Last slide: ' + CTA.replace('\n', ', '));
+  return out.join('\n\n');
+}
+
+function el(tag, cls, text) {
+  var e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+function saveState() { store('plug-cur', String(cur)); store('plug-used', JSON.stringify(used)); }
+function markUsed(i) { if (used.indexOf(i) < 0) used.push(i); }
+function unusedList() {
+  var r = [];
+  for (var i = 0; i < SCRIPTS.length; i++) if (used.indexOf(i) < 0) r.push(i);
+  return r;
+}
+
+function renderPicker() {
+  var p = document.getElementById('picker');
+  p.innerHTML = '';
+  SCRIPTS.forEach(function (s, i) {
+    var b = el('button', 'pick' + (used.indexOf(i) >= 0 && i !== cur ? ' used' : ''));
+    b.type = 'button';
+    b.setAttribute('aria-pressed', i === cur ? 'true' : 'false');
+    var t = el('span', 'tag'); t.appendChild(el('span', '', s.tag));
+    if (used.indexOf(i) >= 0 && i !== cur) t.appendChild(el('span', '', 'used'));
+    b.appendChild(t);
+    b.appendChild(el('span', 'hk', s.nar[0]));
+    b.addEventListener('click', function () { cur = i; markUsed(i); saveState(); render(); window.scrollTo(0, 0); });
+    p.appendChild(b);
+  });
+}
+
+function renderStatus() {
+  var left = unusedList().length;
+  var st = document.getElementById('status');
+  st.innerHTML = '';
+  var b = el('b', '', String(left));
+  st.appendChild(b);
+  st.appendChild(document.createTextNode(' of ' + SCRIPTS.length + ' scripts unused'));
+  document.getElementById('next').textContent = left === 0 ? 'Start over' : 'New script';
+}
+
+function render() {
+  var s = SCRIPTS[cur];
+  renderPicker();
+  renderStatus();
+
+  var c = document.getElementById('count');
+  c.innerHTML = '';
+  var chat = s.lines.length, nar = s.nar.length;
+  [[chat, 'chat texts'], [nar, 'narrator lines'], [1, 'Plug AI slide (yours)'], [1, 'CTA slide'], [chat + nar + 2, 'slides total']].forEach(function (x) {
+    var sp = el('span'); var b = el('b', '', String(x[0])); sp.appendChild(b); sp.appendChild(document.createTextNode(' ' + x[1])); c.appendChild(sp);
+  });
+
+  var cv = document.getElementById('convo');
+  cv.innerHTML = '';
+  s.lines.forEach(function (l) {
+    var who = l.indexOf('her:') === 0 ? 'her' : 'me';
+    var d = el('div', who);
+    var idx = l.indexOf(':');
+    d.appendChild(el('b', '', l.slice(0, idx + 1)));
+    d.appendChild(document.createTextNode(l.slice(idx + 1)));
+    cv.appendChild(d);
+  });
+
+  var ol = document.getElementById('nar');
+  ol.innerHTML = '';
+  s.nar.forEach(function (t, i) {
+    var li = el('li');
+    var w = el('div', 'when');
+    if (AFTER[i] === 0) { w.textContent = 'Before the chat starts'; }
+    else { w.appendChild(document.createTextNode('After this text: ')); w.appendChild(el('em', '', s.lines[AFTER[i] - 1])); }
+    li.appendChild(w);
+    li.appendChild(el('div', 'txt', t));
+    var b = el('button', 'btn small', 'Copy'); b.type = 'button';
+    b.addEventListener('click', function () { copyText(t, b); });
+    li.appendChild(b);
+    ol.appendChild(li);
+    if (i === 3) {
+      ol.appendChild(el('li', 'marker', 'Your Plug AI slide goes here, then the next chat text.'));
+    }
+  });
+  var last = el('li', 'cta');
+  last.appendChild(el('div', 'when', 'Last slide'));
+  last.appendChild(el('div', 'txt', CTA.replace('\n', ' · ')));
+  var cb = el('button', 'btn small', 'Copy'); cb.type = 'button';
+  cb.addEventListener('click', function () { copyText(CTA, cb); });
+  last.appendChild(cb);
+  ol.appendChild(last);
+
+  document.getElementById('cap').textContent = captionText(s);
+}
+
+function nextScript() {
+  var pool = unusedList();
+  if (pool.length === 0) {
+    used = [];
+    pool = [];
+    for (var i = 0; i < SCRIPTS.length; i++) if (i !== cur) pool.push(i);
+  }
+  cur = pool[Math.floor(Math.random() * pool.length)];
+  markUsed(cur);
+  saveState();
+  render();
+  window.scrollTo(0, 0);
+}
+
+function resetDeck() {
+  used = [cur];
+  saveState();
+  render();
+}
+
+function pageSource() {
+  var src = document.getElementById('src');
+  if (src) return src.textContent.split('<\\/' + 'script').join('<' + '/script');
+  return '<!doctype html>\n' + document.documentElement.outerHTML;
+}
+
+document.getElementById('next').addEventListener('click', nextScript);
+document.getElementById('reset').addEventListener('click', resetDeck);
+document.getElementById('copy-convo').addEventListener('click', function () { copyText(SCRIPTS[cur].lines.join('\n'), this); });
+document.getElementById('copy-nar').addEventListener('click', function () { copyText(narrationList(SCRIPTS[cur]), this); });
+document.getElementById('copy-cap').addEventListener('click', function () { copyText(captionText(SCRIPTS[cur]), this); });
+document.getElementById('copy-page').addEventListener('click', function () { copyText(pageSource(), this); });
+brandEl.addEventListener('input', function () { store('plug-brand', brandEl.value); document.getElementById('cap').textContent = captionText(SCRIPTS[cur]); });
+
+brandEl.value = load('plug-brand');
+try { used = JSON.parse(load('plug-used') || '[]').filter(function (n) { return n >= 0 && n < SCRIPTS.length; }); } catch (e) { used = []; }
+var saved = parseInt(load('plug-cur'), 10);
+if (saved >= 0 && saved < SCRIPTS.length) { cur = saved; }
+else { cur = Math.floor(Math.random() * SCRIPTS.length); }
+markUsed(cur);
+render();
+</script>
+</body></html>
