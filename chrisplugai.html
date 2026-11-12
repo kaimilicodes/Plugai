@@ -1,6 +1,560 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body><title>Plug AI Script Library</title>
+<!doctype html>
+<html lang="en"><head>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        const RealURL = URL;
+        const realDecodeURIComponent = decodeURIComponent;
+        const RealTextEncoder = TextEncoder;
+        const realAtob = atob;
+        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
+        // parser-blocking tag. Native fetch, captured before the proxy override below.
+        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
+        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
+        let htmlToImageLoad = null;
+        const loadHtmlToImage = () => {
+          if (!htmlToImageLoad) {
+            htmlToImageLoad = (realFetch
+              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
+              : Promise.reject(new Error('fetch unavailable'))
+            )
+              .then((res) => {
+                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
+                return res.text();
+              })
+              .then((source) => {
+                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
+                // window-global branch; inline script text runs synchronously on insert.
+                const hidden = ['define', 'module', 'exports'].map((k) => {
+                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
+                  try { window[k] = undefined; } catch (e) {}
+                  return entry;
+                });
+                try {
+                  const el = document.createElement('script');
+                  el.text = source;
+                  (document.head || document.documentElement).appendChild(el);
+                } finally {
+                  hidden.forEach(({ k, own, v }) => {
+                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
+                  });
+                }
+                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
+                return window.htmlToImage;
+              });
+            // A failed load may be transient; let the next screenshot retry.
+            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
+          }
+          return htmlToImageLoad;
+        };
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        // storage.get and .list calls not yet answered, read by the parent at this frame's 'load' (an answer may restyle the page); counted
+        // here, not there, because WebKit can run this frame's 'load' in the parent before a message posted while parsing has arrived.
+        let storageReadsOut = 0;
+        try { Object.defineProperty(window, '__storageReadsOut', { configurable: true, get: () => storageReadsOut }); } catch (e) {}
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+              storageReadsOut += 1;
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+              storageReadsOut += 1;
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures and toPng errors so the parent always
+            // gets a response instead of hanging forever.
+            try {
+              const htmlToImage = await loadHtmlToImage();
+              // Draws only the top, 630/1200 of the width tall, as the link preview is 1200x630. `height` also shortens html-to-image's copy of the root and
+              // what its % min- and max-height resolve against, which moves centred content; `style` undoes that. Keep in step with app/page.tsx.
+              const previewHeight = Math.ceil((rootElement.offsetWidth * 630) / 1200);
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                ...(rootElement.offsetHeight > previewHeight && {
+                  height: previewHeight,
+                  style: { height: window.getComputedStyle(rootElement).height, minHeight: '0', maxHeight: 'none' },
+                }),
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            storageReadsOut -= 1;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            storageReadsOut -= 1;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        // An SVG <a> exposes href as an SVGAnimatedString; its baseVal is the attribute
+        // as written, so resolve it against the base URL as the browser does for an HTML <a>.
+        const resolvedHref = (linkEl) => {
+          if (typeof linkEl.href === "string") return linkEl.href;
+          const written = linkEl.href?.baseVal;
+          // A same-document SVG link, such as one that begins an animation, stays with the browser.
+          if (!written || written.trim().startsWith("#")) return "";
+          try {
+            return new RealURL(written, linkEl.baseURI).href;
+          } catch (error) {
+            return written;
+          }
+        };
+
+        // This frame's URL is about:srcdoc, so the browser resolves "#id" against the renderer
+        // page and would load that page in the frame instead of scrolling.
+        const sameDocumentFragment = (linkEl) => {
+          const written = linkEl.getAttribute("href")?.trim();
+          if (!written?.startsWith("#") || document.querySelector("base[href]")) return null;
+          return written.slice(1);
+        };
+
+        const scrollToFragment = (fragment) => {
+          let decoded = fragment;
+          try {
+            decoded = realDecodeURIComponent(fragment);
+          } catch (error) {}
+          let target = document.getElementById(fragment) ?? document.getElementById(decoded);
+          for (const named of target ? [] : document.getElementsByName(decoded)) {
+            if (named.localName === "a") {
+              target = named;
+              break;
+            }
+          }
+          if (target) {
+            target.scrollIntoView();
+          } else if (decoded.toLowerCase() === "top") {
+            window.scrollTo(0, 0);
+          } else {
+            return false;
+          }
+          return true;
+        };
+
+        // Same decoder as dataUrlFile in app/page.tsx; change both together.
+        const hexPair = /^[0-9a-f]{2}$/i;
+        const dataUrlFile = (href) => {
+          const hash = href.indexOf("#");
+          const url = hash === -1 ? href : href.slice(0, hash);
+          const comma = url.indexOf(",");
+          if (comma === -1) return null;
+          const header = url.slice(0, comma);
+          const payload = url.slice(comma + 1);
+          const mimeMatch = header.match(/data:([^;]+)/);
+          const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+          const declaredBase64 = header
+            .split(";")
+            .slice(1)
+            .some((param) => param.trim().toLowerCase() === "base64");
+          const type = mimeMatch ? mimeMatch[1].trim().toLowerCase() : "";
+          const binaryType = type !== "" && !type.startsWith("text/");
+          if (declaredBase64 || (binaryType && !payload.includes("%"))) {
+            let binary = null;
+            try {
+              binary = realAtob(
+                payload.replace(/%([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16))),
+              );
+            } catch (error) {
+              if (declaredBase64) return null;
+            }
+            if (binary !== null) {
+              const bytes = new Uint8Array(binary.length);
+              for (let i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+              }
+              return { mimeType, data: bytes.buffer };
+            }
+          }
+          const input = new RealTextEncoder().encode(payload);
+          const bytes = new Uint8Array(input.length);
+          let length = 0;
+          for (let i = 0; i < input.length; i++) {
+            if (input[i] === 0x25 && i + 2 < input.length) {
+              const pair = String.fromCharCode(input[i + 1], input[i + 2]);
+              if (hexPair.test(pair)) {
+                bytes[length++] = parseInt(pair, 16);
+                i += 2;
+                continue;
+              }
+            }
+            bytes[length++] = input[i];
+          }
+          return { mimeType, data: bytes.slice(0, length).buffer };
+        };
+
+        const onLinkClick = (event) => {
+          // Not instanceof Element: an artifact's own top-level class Element shadows the global.
+          if (typeof event.target?.closest !== "function") return;
+    
+          const linkEl = event.target.closest("a");
+          const href = linkEl && resolvedHref(linkEl);
+          if (!href) return;
+
+          const fragment = sameDocumentFragment(linkEl);
+          if (fragment !== null) {
+            const handledByArtifact = event.defaultPrevented;
+            event.preventDefault();
+            if (handledByArtifact || fragment === "" || scrollToFragment(fragment)) return;
+            // A fragment that names nothing in the artifact may name something in the host,
+            // such as a project thread. The artifact's own listeners still see the click.
+            realParent.postMessage({ type: 'openExternal', href }, '*');
+            return;
+          }
+          const filename = linkEl.getAttribute("download") ?? "";
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (href.startsWith("data:")) {
+            const file = dataUrlFile(href);
+            if (!file) return;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename,
+              data: file.data,
+              mimeType: file.mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href,
+            }, '*');
+          }
+        };
+        window.addEventListener('click', onLinkClick);
+
+        // HACK: a click on an <a download> that is not in the document, or a dispatched click that does not bubble, never reaches the window
+        // listener, so the link gets a listener of its own while its click() or dispatchEvent() runs, after the artifact's. Change with app/page.tsx.
+        const RealAnchor = window.HTMLAnchorElement;
+        const RealMouseEvent = window.MouseEvent;
+        const anchorProto = RealAnchor?.prototype;
+        const superProto = anchorProto && Object.getPrototypeOf(anchorProto);
+        if (typeof RealAnchor === 'function' && typeof RealMouseEvent === 'function' && typeof superProto?.click === 'function' && typeof superProto?.dispatchEvent === 'function') {
+          const onMissedClick = (event) => {
+            if (!event.defaultPrevented) onLinkClick(event);
+          };
+          // Links whose click() or dispatchEvent() is running, so a call made during it leaves the outer call's listener in place.
+          const listening = new WeakSet();
+          const callHearingMissed = (anchor, bubbles, call) => {
+            if (!(anchor instanceof RealAnchor) || !anchor.hasAttribute('download') || (anchor.isConnected && bubbles) || listening.has(anchor)) {
+              return call();
+            }
+            listening.add(anchor);
+            anchor.addEventListener('click', onMissedClick);
+            try {
+              return call();
+            } finally {
+              listening.delete(anchor);
+              anchor.removeEventListener('click', onMissedClick);
+            }
+          };
+          anchorProto.click = function () {
+            return callHearingMissed(this, true, () => superProto.click.call(this));
+          };
+          anchorProto.dispatchEvent = function (event) {
+            const call = () => superProto.dispatchEvent.call(this, event);
+            return event instanceof RealMouseEvent && event.type === 'click' ? callHearingMissed(this, event.bubbles, call) : call();
+          };
+        }
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+
+        try {
+          (() => {
+            const m=1e3,b=Reflect.apply;function lacksWebgl(e,l=Object.getOwnPropertyDescriptor(e.HTMLCanvasElement.prototype,"getContext")?.value){if(typeof e.WebGLRenderingContext!="function")return!0;if(typeof l!="function")return!1;const u=e.document.createElement("canvas"),o=b(l,u,["webgl"])??b(l,u,["experimental-webgl"]);return o instanceof e.WebGLRenderingContext&&o.getExtension("WEBGL_lose_context")?.loseContext(),o===null}function watchWebgl(e,l){const u=e.setTimeout.bind(e),o=e.HTMLCanvasElement.prototype,i=Object.getOwnPropertyDescriptor(o,"getContext"),f=i?.value;if(!i||typeof f!="function")return()=>{};let s=!1,d=!1,p=!1,c=null;const g=new WeakSet,h=new WeakSet,C=t=>{const{width:n,height:r}=t.getBoundingClientRect();return t.isConnected&&t.ownerDocument===e.document&&n>0&&r>0},a=()=>{d||(d=p)},L=(t,n,r)=>{if(n!=="webgl"&&n!=="webgl2"&&n!=="experimental-webgl"){r&&h.add(t);return}if(r){c=!0;return}s||g.has(t)||(c??(c=!lacksWebgl(e,f)),!c&&(g.add(t),e.addEventListener("error",a),e.addEventListener("unhandledrejection",a),p=!0,u(()=>{p=!1},0),u(()=>{!s&&!h.has(t)&&(d||C(t))&&(s=!0,l())},1e3)))};return Object.defineProperty(o,"getContext",{...i,value:function(...n){const r=b(f,this,n);try{L(this,n[0],r!==null)}catch{}return r}}),()=>{s=!0,e.removeEventListener("error",a),e.removeEventListener("unhandledrejection",a),Object.defineProperty(o,"getContext",i)}}
+            watchWebgl(window, () => realParent.postMessage({ type: 'webglUnavailable' }, '*'));
+          })();
+        } catch (e) {}
+
+        // Last, so that if this throws, everything above is already set up. In its own function, so that its names stay local.
+        (() => {
+          function forwardConsole(e,r){const c=String,f=Reflect.apply;let i=0;const p=n=>i>3&&(typeof n=="function"||typeof n=="object"&&n!==null)?"[object Object]":n,s=n=>{try{return c(n??"")}catch{return"[object Object]"}},u=[["log",""],["error","Error: "],["warn","Warning: "]];for(const[n,y]of u){const h=e[n];e[n]=(...o)=>{let l=y;i+=1;try{for(let t=0;t<o.length;t+=1)o[t]=p(o[t]);f(h,e,o);for(let t=0;t<o.length;t+=1)l+=(t===0?"":" ")+s(o[t])}finally{i-=1}r(l)}}}
+          forwardConsole(window.console, (line) => realParent.postMessage({ type: 'console', message: line }, '*'));
+        })();
+      })();
+    </script>
+  <style id="claude-scrollbar">@layer claude-scrollbar{*{scrollbar-width:thin}html{scrollbar-color:rgb(128 128 128 / 50%) transparent}}</style><style id="claude-safe-area">body{border-bottom:env(safe-area-inset-bottom,0px) solid transparent}</style><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body id="artifacts-component-root-html"><title>Plug AI Script Library</title>
 <meta name="claude:viewport-fit-sides" content="cover">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@600;700&family=IBM+Plex+Mono:wght@400;500&family=Manrope:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Manrope:wght@400;500;600;700&amp;display=swap">
 <style>
 /* Layout: one column. Header, brand tag, deck controls (new script / reset), script picker, then the chosen script in three blocks: conversation, narrator lines, caption. */
 :root {
@@ -107,19 +661,19 @@ footer { color: var(--muted); font-size: 13px; }
   <div class="deck">
     <button class="btn" id="next" type="button">New script</button>
     <button class="btn ghost" id="reset" type="button">Reset deck</button>
-    <p class="status" id="status" aria-live="polite"></p>
+    <p class="status" id="status" aria-live="polite"><b>11</b> of 12 scripts unused</p>
   </div>
 
-  <div class="picker" id="picker" role="group" aria-label="All scripts"></div>
+  <div class="picker" id="picker" role="group" aria-label="All scripts"><button class="pick" type="button" aria-pressed="false"><span class="tag"><span>Wrong chat</span></span><span class="hk">She texted the wrong chat. I read every word.</span></button><button class="pick" type="button" aria-pressed="false"><span class="tag"><span>Birthday test</span></span><span class="hk">She said forget my birthday. I didn't.</span></button><button class="pick" type="button" aria-pressed="false"><span class="tag"><span>Breakup bluff</span></span><span class="hk">She said maybe we should break up. I said okay.</span></button><button class="pick" type="button" aria-pressed="false"><span class="tag"><span>Friends think I'm boring</span></span><span class="hk">She said her friends think I'm boring. I said thank them for watching.</span></button><button class="pick" type="button" aria-pressed="false"><span class="tag"><span>Phone died</span></span><span class="hk">Her phone died for eight hours. Then it came back.</span></button><button class="pick" type="button" aria-pressed="false"><span class="tag"><span>Matching energy</span></span><span class="hk">She left me on seen for two days. I matched her pace.</span></button><button class="pick" type="button" aria-pressed="true"><span class="tag"><span>Story likes</span></span><span class="hk">She noticed one like. I noticed one reply.</span></button><button class="pick" type="button" aria-pressed="false"><span class="tag"><span>Favor after ghosting</span></span><span class="hk">She ghosted me for a week. Then she asked for a favor.</span></button><button class="pick" type="button" aria-pressed="false"><span class="tag"><span>Space, then jealous</span></span><span class="hk">She asked for space. Then she watched me enjoy mine.</span></button><button class="pick" type="button" aria-pressed="false"><span class="tag"><span>Double text storm</span></span><span class="hk">She texted five times in ten minutes. I replied once.</span></button><button class="pick" type="button" aria-pressed="false"><span class="tag"><span>Fight for me</span></span><span class="hk">She said I never fight for her. I asked what winning looks like.</span></button><button class="pick" type="button" aria-pressed="false"><span class="tag"><span>Who says sorry first</span></span><span class="hk">We both waited for the other to say sorry. I went first.</span></button></div>
 
-  <div class="count" id="count"></div>
+  <div class="count" id="count"><span><b>18</b> chat texts</span><span><b>10</b> narrator lines</span><span><b>1</b> Plug AI slide (yours)</span><span><b>1</b> CTA slide</span><span><b>30</b> slides total</span></div>
 
   <section class="block" aria-labelledby="h-convo">
     <div class="head">
       <h2 id="h-convo">1. Full conversation</h2>
       <button class="btn" id="copy-convo" type="button">Copy conversation</button>
     </div>
-    <div class="convo" id="convo"></div>
+    <div class="convo" id="convo"><div class="her"><b>her:</b> why did you like Mia's post</div><div class="me"><b>me:</b> why did you reply to Jordan's story</div><div class="her"><b>her:</b> that's different</div><div class="me"><b>me:</b> how is it different</div><div class="her"><b>her:</b> Jordan is just a friend. Mia is... you know</div><div class="me"><b>me:</b> I know Mia from work. you know Jordan from before me. I'm not accusing you, I'd just like us to use the same rules</div><div class="her"><b>her:</b> so you're not mad</div><div class="me"><b>me:</b> not mad. just curious why only my likes count</div><div class="her"><b>her:</b> ugh. fair</div><div class="me"><b>me:</b> want to make a deal</div><div class="her"><b>her:</b> what deal</div><div class="me"><b>me:</b> we trust each other, and if something bugs us we ask instead of keeping score</div><div class="her"><b>her:</b> ok. deal</div><div class="me"><b>me:</b> good. also I only liked it because it was a dog photo</div><div class="her"><b>her:</b> lol it was a very cute dog</div><div class="me"><b>me:</b> it was. dinner Friday</div><div class="her"><b>her:</b> yes. and I'm deleting the second account</div><div class="me"><b>me:</b> what second account</div></div>
   </section>
 
   <section class="block" aria-labelledby="h-nar">
@@ -128,7 +682,7 @@ footer { color: var(--muted); font-size: 13px; }
       <button class="btn" id="copy-nar" type="button">Copy all lines</button>
     </div>
     <p>Each line goes on a reaction picture. It says which text it comes after, so you know where to put it.</p>
-    <ol class="nar" id="nar"></ol>
+    <ol class="nar" id="nar"><li><div class="when">Before the chat starts</div><div class="txt">She noticed one like. I noticed one reply.</div><button class="btn small" type="button">Copy</button></li><li><div class="when">After this text: <em>me: why did you reply to Jordan's story</em></div><div class="txt">She noticed one like.</div><button class="btn small" type="button">Copy</button></li><li><div class="when">After this text: <em>me: how is it different</em></div><div class="txt">She had a rule for me.</div><button class="btn small" type="button">Copy</button></li><li><div class="when">After this text: <em>her: Jordan is just a friend. Mia is... you know</em></div><div class="txt">I wanted to see what she was really doing.</div><button class="btn small" type="button">Copy</button></li><li class="marker">Your Plug AI slide goes here, then the next chat text.</li><li><div class="when">After this text: <em>me: I know Mia from work. you know Jordan from before me. I'm not accusing you, I'd just like us to use the same rules</em></div><div class="txt">I used her rule on her.</div><button class="btn small" type="button">Copy</button></li><li><div class="when">After this text: <em>me: not mad. just curious why only my likes count</em></div><div class="txt">She went quiet.</div><button class="btn small" type="button">Copy</button></li><li><div class="when">After this text: <em>me: want to make a deal</em></div><div class="txt">I offered a deal.</div><button class="btn small" type="button">Copy</button></li><li><div class="when">After this text: <em>me: we trust each other, and if something bugs us we ask instead of keeping score</em></div><div class="txt">She agreed.</div><button class="btn small" type="button">Copy</button></li><li><div class="when">After this text: <em>me: good. also I only liked it because it was a dog photo</em></div><div class="txt">I explained the like.</div><button class="btn small" type="button">Copy</button></li><li><div class="when">After this text: <em>me: it was. dinner Friday</em></div><div class="txt">She admitted too much.</div><button class="btn small" type="button">Copy</button></li><li class="cta"><div class="when">Last slide</div><div class="txt">Search Plug AI on the App Store &amp; Play Store · @plug_ai</div><button class="btn small" type="button">Copy</button></li></ol>
   </section>
 
   <section class="block" aria-labelledby="h-cap">
@@ -136,10 +690,10 @@ footer { color: var(--muted); font-size: 13px; }
       <h2 id="h-cap">3. Caption</h2>
       <button class="btn" id="copy-cap" type="button">Copy caption</button>
     </div>
-    <div class="caption" id="cap"></div>
+    <div class="caption" id="cap">she questioned one like. @plug_ai helped me ask for the same rules both ways #darkpsychology #psychology #48lawsofpower #mindgames</div>
   </section>
 
-  <details class="share" id="share">
+  <details class="share" id="share" open="">
     <summary>Put this page online for free, so friends can use it</summary>
     <div class="body">
       <p>This page is one file, so any free static host can serve it. GitHub Pages is the simplest to do from a phone or laptop.</p>
@@ -165,652 +719,436 @@ var AFTER = [0, 2, 4, 5, 6, 8, 10, 12, 14, 16];
 
 var SCRIPTS = [
   {
-    tag: "Silent treatment",
-    lines: [
-      "her: hey stranger. so you're alive",
-      "me: yeah. busy week",
-      "her: busy? I saw you online yesterday and you couldn't text me for 10 seconds",
-      "me: I could have",
-      "her: I went quiet for two days and you didn't even ask if I was okay. that says a lot about how much you care",
-      "me: I noticed you needed space, so I gave you space. Caring doesn't mean chasing. I'm here now, so what's going on?",
-      "her: that's not fair. I wanted you to reach out",
-      "me: and I wanted you to say that instead of waiting two days",
-      "her: whatever. Jake invited me to his place tonight. just saying",
-      "me: sounds fun. you already decided to go, so what do you want me to add",
-      "her: you don't even care if I go?",
-      "me: I care that you're honest with me. where you go is your call",
-      "her: ok I'm not going. you're so annoying when you're this calm",
-      "me: I want you. I don't need you to prove it",
-      "her: I'm sorry. I shouldn't have tested you",
-      "me: thank you for saying that. we're okay if the silent treatment stays in the past",
-      "her: deal. I miss you",
-      "me: I know. come over Friday and I'll tell you the rest"
+    "tag": "Wrong chat",
+    "lines": [
+      "her: omg he's so easy to read, I swear I can get him to do anything lol",
+      "me: who is?",
+      "her: WRONG CHAT",
+      "me: I figured. it said he's so easy and my name was on top",
+      "her: oh my god. it was a joke for Maya!!",
+      "me: I'm not mad. I'm a bit curious though. what exactly do you think you can get me to do",
+      "her: nothing!! I just meant you're nice",
+      "me: nice and easy aren't the same thing. which one did you mean",
+      "her: nice. obviously nice",
+      "me: ok. then tell Maya I said hi",
+      "her: I'm so embarrassed",
+      "me: don't be. it's the most honest thing you've texted me all week",
+      "her: ugh. ok fine. you're not that easy",
+      "me: I'm very easy to talk to. that's different",
+      "her: I'm sorry",
+      "me: apology accepted. dinner Friday, and you're getting the drinks",
+      "her: deal. I deserve that",
+      "me: and next time, check the chat before you hit send"
     ],
-    nar: [
-      "She went silent to make me chase. I didn't.",
-      "Three days of silence. Then this.",
-      "She was setting up a guilt trip.",
+    "nar": [
+      "She texted the wrong chat. I read every word.",
+      "She had no idea who she'd sent it to.",
+      "Caught in one sentence.",
       "I wanted to see what she was really doing.",
-      "I didn't take the bait.",
-      "Then she tried jealousy.",
-      "I let her have her plans.",
-      "She expected me to react.",
-      "She noticed I wasn't playing.",
-      "She regretted testing me."
-    ],
-    caption: "she went silent to make me chase. @plug_ai read it before I replied"
-  },
-  {
-    tag: "Jealousy test",
-    lines: [
-      "her: so I went out with Marcus last night",
-      "me: nice. did you have fun",
-      "her: that's it? no questions?",
-      "me: you told me because you wanted me to know. I'm glad you did",
-      "her: you're not even a little jealous? most guys would be",
-      "me: I'm curious why it mattered so much that I reacted. I trust you, and I'd rather talk about what you actually want",
-      "her: ugh. you're impossible to read",
-      "me: I'm easy to read. you just keep expecting a different answer",
-      "her: I just thought you'd care more",
-      "me: I care enough not to turn it into a contest",
-      "her: ok fine. Marcus is a coworker. I wanted to see your reaction",
-      "me: I figured. thanks for being honest now",
-      "her: you're not mad?",
-      "me: no. I'd rather we ask each other things directly",
-      "her: deal. next time I'll just ask",
-      "me: that works for me",
-      "her: so what are you doing Friday",
-      "me: dinner with you, if you ask properly"
-    ],
-    nar: [
-      "She tried to make me jealous. I got curious instead.",
-      "She dropped his name on purpose.",
-      "She wanted a reaction.",
-      "I wanted to see what she was really doing.",
-      "I didn't take the bait.",
-      "She tried a different angle.",
-      "I refused to compete.",
-      "She admitted the test.",
-      "She dropped the game.",
-      "She regretted testing me."
-    ],
-    caption: "she tried to make me jealous. @plug_ai helped me stay curious instead"
-  },
-  {
-    tag: "Breadcrumbing",
-    lines: [
-      "her: heyyy stranger",
-      "me: hey. what's up",
-      "her: nothing, was just thinking about you",
-      "me: that's nice. you've been quiet for a week",
-      "her: I know, I've been so busy. we should hang out soon",
-      "me: soon is vague. I'm free Thursday if you want a real plan",
-      "her: Thursday is tough. maybe next week?",
-      "me: maybe isn't a plan, but I'll be around",
-      "her: don't be like that",
-      "me: I'm not being like anything. I just like plans more than promises",
-      "her: wow okay. I do like you, you know",
-      "me: I believe you. I also believe actions, and so far it's mostly been messages",
-      "her: that's harsh",
-      "me: it's honest. I enjoy talking to you, and I want to see you, not just text",
-      "her: ok Thursday. I'll make it work",
-      "me: great. tell me the time and place and I'm there",
-      "her: 7? I'll send the address",
-      "me: perfect. see you then"
-    ],
-    nar: [
-      "She kept me on the hook with maybes. I asked for a plan.",
-      "Out of nowhere, a text.",
-      "I noticed the pattern.",
-      "I wanted to see what she was really doing.",
-      "I asked for a plan instead.",
+      "I didn't gloat. I got curious.",
       "She tried to soften it.",
-      "I held my line.",
-      "She felt the shift.",
-      "Maybe turned into a time.",
-      "She stopped hiding behind maybes."
+      "I let her sit in it.",
+      "She finally told the truth.",
+      "She stopped talking down.",
+      "She owed me dinner."
     ],
-    caption: "she kept saying maybe. @plug_ai helped me ask for a plan"
+    "caption": "she sent me the text meant for her friend. @plug_ai helped me stay calm and get curious"
   },
   {
-    tag: "Love-bombing",
-    lines: [
-      "her: I've never felt this way about anyone",
-      "me: that's sweet. we've only known each other a few days though",
-      "her: when you know, you know",
-      "me: sometimes. I'd like to know you a bit longer first",
-      "her: I already know you're the one. I told my friends about us",
-      "me: I'm flattered. I want to take this slow so it's real, not just intense",
-      "her: so you don't feel the same way",
-      "me: I feel good about us. feeling good and feeling certain take different amounts of time",
-      "her: it feels like you're pulling away",
-      "me: I'm not pulling away. I'm just not rushing",
-      "her: I'd do anything for you. why can't you do the same",
-      "me: I'm doing what I can honestly do right now, which is show up and be consistent",
-      "her: ok. I guess I'm just excited",
-      "me: I like that you're excited. I'd like us to enjoy this without a deadline",
-      "her: you're right. sorry for coming on strong",
-      "me: no need to apologize. thanks for saying that",
-      "her: dinner Saturday?",
-      "me: yes. I'll pick the place"
+    "tag": "Birthday test",
+    "lines": [
+      "her: so what are we doing for my birthday",
+      "me: what do you want to do",
+      "her: nothing. it's fine. don't make a big deal",
+      "me: ok. we can keep it low-key",
+      "her: wow. ok. so you really don't care about my birthday",
+      "me: I care. you said not to make it a big deal, so I'm asking what you'd actually enjoy. tell me one thing that would feel good",
+      "her: I don't know. just something",
+      "me: something is hard to book. pick a vibe: quiet, fun or surprise",
+      "her: quiet",
+      "me: quiet it is. I'll handle the rest",
+      "her: you don't have to",
+      "me: I know. I want to",
+      "her: ok. thank you",
+      "me: dress comfy and keep Saturday night free",
+      "her: why comfy",
+      "me: that's all you get",
+      "her: you're being mysterious",
+      "me: it's called a birthday plan. see you at 7"
     ],
-    nar: [
-      "She said I love you after three days. I slowed it down.",
-      "Day three. She'd already picked a future.",
-      "Too much, too fast.",
+    "nar": [
+      "She said forget my birthday. I didn't.",
+      "She said it didn't matter.",
+      "She wanted me to read between the lines.",
       "I wanted to see what she was really doing.",
-      "I stayed warm, and I slowed it down.",
-      "Then it turned into a test.",
-      "She read my pace as distance.",
-      "I kept my answer simple.",
-      "She felt the pressure ease.",
-      "Slow turned out to be better."
+      "I asked what she actually wanted.",
+      "She gave me a vibe.",
+      "I made the plan small and real.",
+      "She stopped testing me.",
+      "I kept it a surprise.",
+      "She was smiling at a text."
     ],
-    caption: "she said I love you after three days. @plug_ai helped me keep the pace steady"
+    "caption": "she said forget my birthday. @plug_ai helped me read what she actually wanted"
   },
   {
-    tag: "We need to talk",
-    lines: [
-      "her: we need to talk",
-      "me: sure. what about",
-      "her: not over text",
-      "me: ok. tell me when you're free and I'll make time",
-      "her: you're being weirdly calm. I don't like it",
-      "me: I'd rather stay calm and hear what's on your mind than guess. what's going on",
-      "her: it's about how you've been acting lately",
-      "me: which part? I'd like to understand it properly",
-      "her: you've been distant",
-      "me: I've been busy, and I could have said so. thanks for telling me",
-      "her: so you're not mad",
-      "me: not at all. is that what the talk was about",
-      "her: kind of. I thought you were losing interest",
-      "me: I'm not. I'd rather you ask me than assume",
-      "her: ok. I'm sorry I made it sound so serious",
-      "me: it's fine. I'm glad we talked",
-      "her: can we get food tonight",
-      "me: yes. you pick"
+    "tag": "Breakup bluff",
+    "lines": [
+      "her: I've been thinking",
+      "me: about what",
+      "her: maybe we're not working",
+      "me: what makes you say that",
+      "her: maybe we should just break up",
+      "me: I'm not going to beg and I'm not going to fight about it. if that's what you want, tell me clearly and I'll respect it",
+      "her: wait what",
+      "me: you said maybe we should break up. I'm taking you seriously",
+      "her: I didn't mean it like that",
+      "me: then how did you mean it",
+      "her: I wanted you to say you'd fight for me",
+      "me: I'd rather build something with you than fight to keep a threat off the table",
+      "her: ...that's actually fair",
+      "me: so what's really bothering you",
+      "her: I feel like we barely see each other",
+      "me: that's fixable. I'm free Wednesday and Saturday",
+      "her: ok. Wednesday",
+      "me: Wednesday. and no more breakup texts unless you mean them"
     ],
-    nar: [
-      "She texted we need to talk. I asked her to be specific.",
-      "Four words. No context.",
-      "She wanted me to panic.",
-      "I wanted to see what she was really doing.",
-      "I asked questions instead of reacting.",
-      "She stopped being vague.",
-      "I didn't explain myself.",
-      "The big talk got small.",
-      "It was never really that serious.",
-      "Calm ended the game."
-    ],
-    caption: "she texted we need to talk. @plug_ai helped me stay calm and ask the right questions"
-  },
-  {
-    tag: "Hot and cold",
-    lines: [
-      "her: good morning!! I missed you",
-      "me: good morning. missed you too",
-      "her: yesterday was so fun, can't stop smiling",
-      "me: same. you made my week",
-      "her: ok but I'm super busy now, talk later",
-      "me: no problem. I'll be around, and I'll reply when I can",
-      "her: wow that was a cold reply",
-      "me: it was a calm reply. you said you were busy",
-      "her: yesterday you were all over me, today it's different",
-      "me: yesterday you were all over me too. I'm just following your pace",
-      "her: so you're copying me",
-      "me: I'm meeting you where you are. if you want more, tell me",
-      "her: I want you to try harder",
-      "me: I'll gladly show up. I won't chase someone who keeps changing the pace",
-      "her: that's fair. I've been inconsistent",
-      "me: thanks for saying it. consistency works for me",
-      "her: ok. call me tonight",
-      "me: 8 works"
-    ],
-    nar: [
-      "She was hot one day and cold the next. I stayed steady.",
-      "Warm morning. Warm reply.",
-      "She was all in.",
-      "I wanted to see what she was really doing.",
-      "I didn't follow the swing.",
-      "She noticed my calm.",
-      "I matched her pace.",
-      "She accused me of copying.",
-      "I stayed steady.",
-      "She admitted it."
-    ],
-    caption: "hot one day, cold the next. @plug_ai helped me stay steady"
-  },
-  {
-    tag: "Ghost returns",
-    lines: [
-      "her: hey you",
-      "me: hey. it's been a while",
-      "her: I know, life got crazy",
-      "me: I figured",
-      "her: I've been thinking about you a lot. I miss talking to you",
-      "me: I'm glad you're doing well. I missed the chats too, but I need consistency from people I talk to. what changed",
-      "her: I got overwhelmed. I'm sorry",
-      "me: thanks for saying that. what do you want now",
-      "her: to pick up where we left off",
-      "me: we can't pick up from silence. we can start fresh and see how it goes",
-      "her: so you're mad at me",
-      "me: not mad. just more careful than before",
-      "her: that's fair. what if I call you this weekend",
-      "me: I'd like that, if you call",
-      "her: I will. promise",
-      "me: great. I'll hold you to the call, not the promise",
-      "her: ha. fair. Saturday at 6?",
-      "me: Saturday at 6 works"
-    ],
-    nar: [
-      "She ghosted me for three weeks. Then she said hey.",
-      "Three weeks of nothing. Then a text.",
-      "She acted like no time had passed.",
-      "I wanted to see what she was really doing.",
-      "I stayed warm, not eager.",
-      "She asked for a reset.",
-      "I didn't hand it over.",
-      "She heard the difference.",
-      "I asked for action, not promises.",
-      "She had to show up."
-    ],
-    caption: "she ghosted me for three weeks, then said hey. @plug_ai helped me answer without chasing"
-  },
-  {
-    tag: "Cancelled plans",
-    lines: [
-      "her: omg I'm so sorry, I can't make tonight",
-      "me: no worries. what happened",
-      "her: just really tired. can we do next week?",
-      "me: sure. this is the third time though",
-      "her: you're making me feel guilty. I'm literally exhausted",
-      "me: I'm not trying to make you feel guilty. I get being tired. I'd just rather you tell me when you actually want to plan something, and I'll be there",
-      "her: I do want to see you",
-      "me: good. then pick a day you're sure about",
-      "her: I don't know yet",
-      "me: ok. let me know when you do",
-      "her: that's it? you're not going to push?",
-      "me: no. I'd rather you come to me when you're ready",
-      "her: ok wow. what about Thursday",
-      "me: Thursday works if you confirm Thursday morning",
-      "her: deal. I'll text you at 9",
-      "me: perfect",
-      "her: and I'll pick the place this time",
-      "me: sounds good"
-    ],
-    nar: [
-      "She cancelled on me three times. I stopped rescheduling.",
-      "Another cancellation.",
-      "I had been counting quietly.",
-      "I wanted to see what she was really doing.",
-      "I stayed kind and clear.",
-      "She wanted me to chase a date.",
-      "I put the choice back on her.",
-      "She expected a push.",
-      "I waited. She came back.",
-      "She made the plan herself."
-    ],
-    caption: "third cancelled plan. @plug_ai helped me put the choice back on her"
-  },
-  {
-    tag: "Ultimatum",
-    lines: [
-      "her: where are you",
-      "me: at the gym. what's up",
-      "her: you've been on your phone all day and haven't texted me",
-      "me: I've been busy",
-      "her: reply within 10 minutes next time or I'm done",
-      "me: I want to talk, but I don't respond well to deadlines. tell me what's bothering you and I'll answer properly",
-      "her: I just feel ignored",
-      "me: that's useful to know. I wasn't ignoring you, I was busy. I can text you more during the day",
-      "her: I don't want to feel like I'm begging",
-      "me: you don't have to beg. you can just ask me",
-      "her: ok. can you text me during lunch",
-      "me: yes. I'll text you at 1",
-      "her: really?",
-      "me: really. I like it when you tell me straight",
-      "her: sorry about the ten minutes thing",
-      "me: it's fine. just say it directly next time",
-      "her: ok. what are you doing after the gym",
-      "me: dinner with you, if you want"
-    ],
-    nar: [
-      "She gave me ten minutes to reply. I took twenty.",
-      "A countdown, out of nowhere.",
-      "She started with pressure.",
-      "I wanted to see what she was really doing.",
-      "I didn't take the deadline.",
-      "The pressure turned into a feeling.",
-      "I answered the feeling.",
-      "She stopped demanding.",
-      "She asked directly.",
-      "Honesty beat the deadline."
-    ],
-    caption: "she gave me ten minutes to reply. @plug_ai helped me answer the feeling, not the deadline"
-  },
-  {
-    tag: "Ex talk",
-    lines: [
-      "her: I ran into my ex today",
-      "me: oh yeah? how was that",
-      "her: weird. he said I look good",
-      "me: you do",
-      "her: that's it? you're not bothered he's still into me?",
-      "me: I'm not bothered. he's your past. I'm more interested in what you want now",
-      "her: ugh. why are you so calm",
-      "me: because I don't have anything to prove",
-      "her: most guys would ask a million questions",
-      "me: I'd rather ask one. do you want to be with him",
-      "her: no. obviously not",
-      "me: good. then we're fine",
-      "her: I just wanted to see if you'd care",
-      "me: I care. I just don't need a test to show it",
-      "her: ok that's sweet",
-      "me: I mean it",
-      "her: so are we still on for Friday",
-      "me: absolutely"
-    ],
-    nar: [
-      "She brought up her ex to see how I'd react.",
-      "She dropped a name.",
+    "nar": [
+      "She said maybe we should break up. I said okay.",
+      "Out of nowhere.",
       "She wanted a reaction.",
       "I wanted to see what she was really doing.",
-      "I didn't flinch.",
-      "She tried to push harder.",
-      "I asked one question.",
-      "She admitted the test.",
-      "I answered with calm.",
-      "The ex stopped mattering."
-    ],
-    caption: "she brought up her ex to see my face. @plug_ai helped me stay curious"
-  },
-  {
-    tag: "Future faking",
-    lines: [
-      "her: we should totally go to Bali together this summer",
-      "me: that would be amazing",
-      "her: and then Paris next year!",
-      "me: you've got big plans",
-      "her: you're the person I want to do all of it with",
-      "me: I love hearing that. let's start small. are you free Friday night",
-      "her: um, I have a thing",
-      "me: ok. Saturday then",
-      "her: I'm not sure about Saturday either",
-      "me: no problem. I just like plans I can actually plan",
-      "her: you don't believe me about Bali",
-      "me: I believe you mean it. I'd like to see us do something this week first",
-      "her: ok that's fair",
-      "me: how about coffee Sunday",
-      "her: Sunday works",
-      "me: great. 11?",
-      "her: 11 is perfect",
-      "me: see you then"
-    ],
-    nar: [
-      "She planned our whole summer. I asked about Friday.",
-      "Big promises. No dates.",
-      "She painted a whole future.",
-      "I wanted to see what she was really doing.",
-      "I loved the vision. I asked about Friday.",
-      "The future got vague fast.",
-      "I stayed practical.",
-      "She felt called out, kindly.",
-      "Small plans first.",
-      "She got a date, not a dream."
-    ],
-    caption: "she planned our whole summer but not Friday. @plug_ai helped me keep it real"
-  },
-  {
-    tag: "Delayed reply",
-    lines: [
-      "her: hey",
-      "me: hey. you went quiet earlier",
-      "her: yeah I was busy",
-      "me: no worries",
-      "her: you've been so distant today",
-      "me: I texted you this morning and gave you space. I'm happy to talk now. what's up",
-      "her: you didn't text me all afternoon",
-      "me: you hadn't replied yet, so I figured you were busy",
-      "her: I was, but you could have checked on me",
-      "me: I could have. next time I'll send another text. I'd like the same from you",
-      "her: that's fair",
-      "me: I'm not keeping score. I just like balance",
-      "her: balance. ok",
-      "me: how was your day",
-      "her: long. tell me about yours",
-      "me: better now that you replied",
-      "her: you're sweet",
-      "me: call me when you're free"
-    ],
-    nar: [
-      "She took six hours to reply. Then I was the distant one.",
-      "Six hours of silence.",
-      "Then a complaint.",
-      "I wanted to see what she was really doing.",
-      "I didn't accept the blame.",
-      "She tried to shift it.",
-      "I stayed fair.",
-      "She heard the balance.",
-      "I kept it light.",
-      "She finally showed up."
-    ],
-    caption: "six hours to reply, then I was the distant one. @plug_ai helped me stay fair"
-  },
-  {
-    tag: "Comparison",
-    lines: [
-      "her: Mark texts me back instantly",
-      "me: good for Mark",
-      "her: just saying, he's very attentive",
-      "me: I'm glad he's attentive",
-      "her: you could learn something from him",
-      "me: if there's something you'd like from me, tell me directly and I'll see if I can do it. I'm not going to compete with Mark",
-      "her: you're no fun when you're like this",
-      "me: I'm happy to have fun. I just won't compete for your attention",
-      "her: I wasn't trying to start something",
-      "me: I know. you were trying to see what I'd do",
-      "her: ...maybe",
-      "me: that's okay. I'd rather you ask for what you want",
-      "her: ok. I want you to text me more",
-      "me: I can do that",
-      "her: really?",
-      "me: yes. you asked directly, so now I know",
-      "her: thank you",
-      "me: you're welcome. what are you up to tonight"
-    ],
-    nar: [
-      "She told me another guy texts back faster. I thanked her.",
-      "She brought up another guy.",
-      "She was holding up a mirror.",
-      "I wanted to see what she was really doing.",
-      "I refused to compete.",
-      "She called me boring.",
-      "I stayed warm.",
-      "She admitted the test.",
-      "She asked directly.",
-      "A direct ask got a direct answer."
-    ],
-    caption: "she told me about another guy on purpose. @plug_ai helped me not compete"
-  },
-  {
-    tag: "Moving goalposts",
-    lines: [
-      "her: you forgot to text me good morning",
-      "me: sorry. I'll send it tomorrow",
-      "her: and last night you texted late",
-      "me: I was working. I'll tell you earlier next time",
-      "her: I just feel like you never put in effort",
-      "me: I hear that. I've adjusted the last two things you asked. tell me what a good week looks like for you",
-      "her: I don't know. just more",
-      "me: more of what. give me one thing I can do",
-      "her: call me every night",
-      "me: I can do three nights a week. every night won't work with my schedule",
-      "her: three isn't enough",
-      "me: then we might want different things, and that's okay. let's figure out which",
-      "her: wait, I don't want that",
-      "me: ok. then let's agree on something realistic",
-      "her: four nights?",
-      "me: four works",
-      "her: thank you",
-      "me: thank you for being specific"
-    ],
-    nar: [
-      "Nothing I did was enough. So I asked what enough was.",
-      "Every complaint was a new rule.",
-      "The list kept growing.",
-      "I wanted to see what she was really doing.",
-      "I asked what enough looks like.",
-      "She couldn't name it.",
-      "I offered something real.",
-      "I told her the truth.",
-      "She backed down.",
-      "Clear beats endless."
-    ],
-    caption: "nothing was ever enough. @plug_ai helped me ask what enough looks like"
-  },
-  {
-    tag: "I'm fine",
-    lines: [
-      "her: I'm fine",
-      "me: ok. you don't sound fine",
-      "her: I said I'm fine",
-      "me: ok",
-      "her: you're not even going to ask what's wrong?",
-      "me: I asked once and you said you're fine. I'm here if you want to tell me, and I'm not going to guess",
-      "her: you should just know",
-      "me: I wish I could read minds. I can listen though",
-      "her: you didn't text me back yesterday",
-      "me: thank you for telling me. I was in meetings and didn't see it",
-      "her: I felt ignored",
-      "me: that makes sense. I'm sorry it felt that way",
-      "her: really?",
-      "me: yes. I'd rather hear it than guess",
-      "her: ok. I'm sorry I got short with you",
-      "me: no problem. thanks for opening up",
-      "her: can I call you",
-      "me: of course"
-    ],
-    nar: [
-      "She said I'm fine. She wasn't. I asked once.",
-      "Two words. Zero information.",
-      "She wanted me to guess.",
-      "I wanted to see what she was really doing.",
-      "I asked once. Then I waited.",
-      "She wanted me to read her mind.",
-      "I offered to listen.",
+      "I took her seriously.",
+      "She panicked first.",
+      "I asked the real question.",
       "The real issue came out.",
-      "I took the fair part.",
-      "She told me directly."
+      "I turned it into a plan.",
+      "She stopped using the exit as a threat."
     ],
-    caption: "she said I'm fine. @plug_ai helped me ask once and wait"
+    "caption": "she said maybe we should break up. @plug_ai helped me answer without panicking"
   },
   {
-    tag: "Late-night text",
-    lines: [
-      "her: you up?",
-      "me: morning. what's up",
-      "her: haha you ignored me last night",
-      "me: I was asleep",
-      "her: I was bored and wanted to talk. you always answer",
-      "me: I'm happy to talk at normal hours. I'm not available for 1 a.m. boredom",
-      "her: wow, harsh",
-      "me: it's honest. I like talking to you when you actually want to talk to me, not just when you're bored",
-      "her: I do want to talk to you",
-      "me: good. then call me tonight",
-      "her: you're not mad?",
-      "me: no. I just have boundaries",
-      "her: ok. I respect that",
-      "me: thank you",
-      "her: what time tonight",
-      "me: 8",
-      "her: it's a date",
-      "me: it's a date"
+    "tag": "Friends think I'm boring",
+    "lines": [
+      "her: my friends think you're kind of boring",
+      "me: ha. which friends",
+      "her: all of them",
+      "me: that's a lot of opinions about someone they met once",
+      "her: I'm just telling you what they said",
+      "me: thanks for telling me. I don't need everyone's vote, I care what you think. do you think I'm boring",
+      "her: no",
+      "me: then I'm good",
+      "her: you're not even a little offended",
+      "me: no. I'd rather show them than argue about it",
+      "her: ok that was kind of good",
+      "me: I have my moments",
+      "her: they want to meet you again",
+      "me: tell them I'll bring the entertainment",
+      "her: lol what does that mean",
+      "me: you'll see Saturday",
+      "her: now I'm nervous",
+      "me: good. nervous means it'll be fun"
     ],
-    nar: [
-      "She texted at 1 a.m. I answered at 9.",
-      "1 a.m. Two words.",
-      "I let it sit until morning.",
+    "nar": [
+      "She said her friends think I'm boring. I said thank them for watching.",
+      "She started with her friends' opinion.",
+      "She was testing my ego.",
       "I wanted to see what she was really doing.",
-      "I stayed warm and clear.",
-      "She called it harsh.",
-      "I told her what I actually wanted.",
-      "She stopped arguing.",
-      "I set the time.",
-      "A real plan beat a late-night text."
+      "I didn't defend myself.",
+      "She had no comeback.",
+      "I stayed light.",
+      "She flipped the script.",
+      "I gave her something to look forward to.",
+      "The friends got their answer."
     ],
-    caption: "1 a.m. text. @plug_ai helped me set a boundary without a fight"
+    "caption": "her friends called me boring. @plug_ai helped me not take the bait"
   },
   {
-    tag: "Distance test",
-    lines: [
-      "her: I think we should take a step back",
-      "me: ok. what do you mean by that",
-      "her: I need space to figure some things out",
-      "me: that's fair",
-      "her: you're not going to try to change my mind?",
-      "me: I'd rather you decide freely. take the space you need, and I'll be here if you want to talk",
-      "her: you're being weirdly okay with this",
-      "me: I want you to be sure. I don't want to talk you into anything",
-      "her: what if I'm not sure",
-      "me: then take your time. I'm not going anywhere, but I'm also not going to wait forever",
-      "her: that's kind of intense",
-      "me: it's honest. I want clarity, not limbo",
-      "her: ok. give me a few days",
-      "me: a few days is fine",
-      "her: I'll text you Wednesday",
-      "me: ok. talk then",
-      "her: thank you for understanding",
-      "me: of course"
+    "tag": "Phone died",
+    "lines": [
+      "her: omg my phone died",
+      "me: all day?",
+      "her: yes! the charger broke",
+      "me: that's rough",
+      "her: you weren't even worried about me. you didn't call or anything",
+      "me: I figured you were okay and I didn't want to crowd you. I'm glad you're back. what happened today",
+      "her: I was with Chloe, just hanging out",
+      "me: nice. sounds fun",
+      "her: you're not going to ask more",
+      "me: you told me what you wanted to tell me",
+      "her: I might have been ignoring you a little",
+      "me: thanks for being honest. I figured the charger story had a few missing pieces",
+      "her: I just needed a day",
+      "me: that's allowed. you can just say that next time",
+      "her: ok. next time I will",
+      "me: good. want to talk now",
+      "her: yes. call me",
+      "me: calling"
     ],
-    nar: [
-      "She pulled away to see if I'd chase. I gave her space.",
-      "She wanted space.",
-      "I said okay.",
+    "nar": [
+      "Her phone died for eight hours. Then it came back.",
+      "Eight hours. No contact.",
+      "The excuse came with a story.",
       "I wanted to see what she was really doing.",
-      "I didn't try to talk her out of it.",
-      "She didn't expect that.",
-      "I let her choose freely.",
-      "I named my boundary.",
-      "She gave me a date.",
+      "I didn't call her out. I let her talk.",
+      "She added details.",
+      "I stayed warm.",
+      "She told the truth.",
+      "I made it easy to be honest.",
+      "She picked up on the first ring."
+    ],
+    "caption": "her phone died for eight hours. @plug_ai helped me let her tell the truth herself"
+  },
+  {
+    "tag": "Matching energy",
+    "lines": [
+      "her: hey are you free tonight",
+      "me: depends. what's the plan",
+      "her: no plan yet. just checking",
+      "me: let me know when you have one",
+      "her: you're being weird. last week you were free every night",
+      "me: last week you didn't reply for two days. I'm just matching the energy",
+      "her: that's different",
+      "me: how",
+      "her: I was busy",
+      "me: and tonight I'm busy",
+      "her: with what",
+      "me: with being someone who plans ahead",
+      "her: wow",
+      "me: I'm kidding. kind of",
+      "her: ok I get it. I'll plan something properly",
+      "me: that's all I need",
+      "her: dinner at 8?",
+      "me: dinner at 8 works"
+    ],
+    "nar": [
+      "She left me on seen for two days. I matched her pace.",
+      "Out of nowhere, a text.",
+      "A plan with no details.",
+      "I wanted to see what she was really doing.",
+      "I matched her energy.",
+      "She called it weird.",
+      "I asked one question.",
+      "I kept it light.",
+      "She planned it properly.",
+      "A real plan beat a late text."
+    ],
+    "caption": "she left me on seen for two days. @plug_ai helped me match her energy, not chase"
+  },
+  {
+    "tag": "Story likes",
+    "lines": [
+      "her: why did you like Mia's post",
+      "me: why did you reply to Jordan's story",
+      "her: that's different",
+      "me: how is it different",
+      "her: Jordan is just a friend. Mia is... you know",
+      "me: I know Mia from work. you know Jordan from before me. I'm not accusing you, I'd just like us to use the same rules",
+      "her: so you're not mad",
+      "me: not mad. just curious why only my likes count",
+      "her: ugh. fair",
+      "me: want to make a deal",
+      "her: what deal",
+      "me: we trust each other, and if something bugs us we ask instead of keeping score",
+      "her: ok. deal",
+      "me: good. also I only liked it because it was a dog photo",
+      "her: lol it was a very cute dog",
+      "me: it was. dinner Friday",
+      "her: yes. and I'm deleting the second account",
+      "me: what second account"
+    ],
+    "nar": [
+      "She noticed one like. I noticed one reply.",
+      "She noticed one like.",
+      "She had a rule for me.",
+      "I wanted to see what she was really doing.",
+      "I used her rule on her.",
+      "She went quiet.",
+      "I offered a deal.",
+      "She agreed.",
+      "I explained the like.",
+      "She admitted too much."
+    ],
+    "caption": "she questioned one like. @plug_ai helped me ask for the same rules both ways"
+  },
+  {
+    "tag": "Favor after ghosting",
+    "lines": [
+      "her: hey! so I need a huge favor",
+      "me: hey. long time",
+      "her: I know, I've been busy. can you drive me to the airport Friday",
+      "me: what time",
+      "her: 6am. you're the only one I trust with this",
+      "me: I'm flattered you'd ask me, and I'm happy to help. it's hard to say yes at 6am when I haven't heard from you in a week. what's going on",
+      "her: I've just been overwhelmed",
+      "me: I get it. I'll do the airport run if we talk first tonight, a real call",
+      "her: that's kind of a condition",
+      "me: it's a boundary. I like being someone you can rely on, not only someone you text when you need something",
+      "her: ...fair",
+      "me: call me at 8 and we'll sort the rest",
+      "her: ok. 8",
+      "me: ok",
+      "her: thank you",
+      "me: Friday 6am. I'll bring coffee",
+      "her: you're the best",
+      "me: remember that when I text you at 6 that I'm outside"
+    ],
+    "nar": [
+      "She ghosted me for a week. Then she asked for a favor.",
+      "A week of silence. Then a favor.",
+      "She said I was the only one she trusted.",
+      "I wanted to see what she was really doing.",
+      "I said yes, with one condition.",
+      "She called it a condition.",
+      "I called it a boundary.",
+      "She agreed.",
+      "I kept my word.",
+      "I got my coffee."
+    ],
+    "caption": "she ghosted me for a week then asked for a favor. @plug_ai helped me set one boundary"
+  },
+  {
+    "tag": "Space, then jealous",
+    "lines": [
+      "her: I need some space right now",
+      "me: ok. take what you need",
+      "her: I'll text you when I'm ready",
+      "me: sounds good",
+      "her: so you went out Saturday?",
+      "me: I did. you asked for space, so I gave you space and went to dinner with friends. how are you",
+      "her: I'm fine. I just thought you'd wait around",
+      "me: I'm happy to wait for you. I just won't pause my life",
+      "her: that sounds cold",
+      "me: it's the opposite. I want to be with you because I want to, not because I'm sitting by the phone",
+      "her: ok. that's actually healthy",
+      "me: it's a start",
+      "her: so were you thinking about me",
+      "me: a bit. I saved you the best fry",
+      "her: lol what",
+      "me: ask me about it Friday",
+      "her: Friday?",
+      "me: Friday. I'll tell you the rest"
+    ],
+    "nar": [
+      "She asked for space. Then she watched me enjoy mine.",
+      "She asked for space. I gave it.",
+      "Two days of nothing.",
+      "I wanted to see what she was really doing.",
+      "I told her the truth.",
+      "She expected me to wait.",
+      "I didn't pause my life.",
+      "She changed her tone.",
+      "I gave her a reason to text.",
       "Space worked both ways."
     ],
-    caption: "she pulled away to see if I'd chase. @plug_ai helped me give her space"
+    "caption": "she asked for space then asked who I went out with. @plug_ai helped me stay honest and calm"
   },
   {
-    tag: "You've changed",
-    lines: [
-      "her: you've changed",
-      "me: probably. how do you mean",
-      "her: you used to text me all day",
-      "me: I used to have more free time",
-      "her: it feels like you don't care anymore",
-      "me: I care. my schedule changed, and I should have told you. what would help you feel more connected",
-      "her: I don't know. just feeling like a priority",
-      "me: you're a priority. I'll show it more clearly",
-      "her: how",
-      "me: a call every evening, and a good morning text before work",
-      "her: that's actually nice",
-      "me: I also want to hear what you're willing to do on your side",
-      "her: I can plan one weekend date",
-      "me: great. pick a weekend",
-      "her: this one?",
-      "me: this one works",
-      "her: yay",
-      "me: yay"
+    "tag": "Double text storm",
+    "lines": [
+      "her: hey",
+      "me: hey",
+      "her: hello??",
+      "me: sorry, in a meeting. what's up",
+      "her: you're ignoring me. this is the third time this week",
+      "me: I'm not ignoring you. I was working and I'm here now. what's going on",
+      "her: I just want you to care",
+      "me: I care. caring doesn't mean answering in seconds",
+      "her: ok but it feels like you don't",
+      "me: that's a real feeling. thank you for saying it. what would help",
+      "her: a text during the day",
+      "me: I can do a quick one at lunch",
+      "her: really?",
+      "me: yes. one text, every day, 1pm",
+      "her: ok that's actually sweet",
+      "me: and you give me some room when I'm in meetings",
+      "her: deal",
+      "me: deal. now what was the emergency"
     ],
-    nar: [
-      "She said I've changed. I agreed.",
-      "Three words. A lot of weight.",
-      "She wanted me defensive.",
+    "nar": [
+      "She texted five times in ten minutes. I replied once.",
+      "Hey. Hello??",
+      "She counted the minutes.",
       "I wanted to see what she was really doing.",
-      "I agreed and asked for details.",
-      "She had no real list.",
-      "I offered specifics.",
-      "I asked for her half.",
-      "She found her side.",
-      "Balance beat blame."
+      "I stayed calm.",
+      "She asked for proof.",
+      "I offered something real.",
+      "She softened.",
+      "We made a deal.",
+      "We both got what we needed."
     ],
-    caption: "she said I've changed. @plug_ai helped me agree and get specific"
+    "caption": "she texted five times in ten minutes. @plug_ai helped me answer once, calmly"
+  },
+  {
+    "tag": "Fight for me",
+    "lines": [
+      "her: do you even want to be with me",
+      "me: yes. why do you ask",
+      "her: you never fight for me",
+      "me: what would fighting for you look like",
+      "her: I don't know. showing up, not letting me go",
+      "me: I'm here and I'm not going anywhere. I'd rather show up every day than do dramatic gestures. what would feel like fighting for you",
+      "her: you could be jealous",
+      "me: jealousy isn't love. it's just noise",
+      "her: that's a good line",
+      "me: I mean it though",
+      "her: ok. what would you do",
+      "me: I'd plan one thing a week that's just for you",
+      "her: like what",
+      "me: this week, a sunset walk and the noodle place you like",
+      "her: you remembered",
+      "me: I remember most things you say",
+      "her: ok I'm convinced",
+      "me: good. Thursday, 6pm"
+    ],
+    "nar": [
+      "She said I never fight for her. I asked what winning looks like.",
+      "She wanted a grand gesture.",
+      "She wanted proof.",
+      "I wanted to see what she was really doing.",
+      "I asked what she needed.",
+      "She asked for jealousy.",
+      "I refused to perform.",
+      "She asked what I'd do.",
+      "I got specific.",
+      "She noticed I remembered."
+    ],
+    "caption": "she said I never fight for her. @plug_ai helped me answer with a plan, not a performance"
+  },
+  {
+    "tag": "Who says sorry first",
+    "lines": [
+      "her: so are we just not talking now",
+      "me: I'm here. are you",
+      "her: you were the one who was rude",
+      "me: I was. I'm sorry for how I said it",
+      "her: you're apologizing? I expected you to say I was overreacting",
+      "me: I'd rather fix it than win it. I'm sorry for the tone. I still disagree with part of it, and I'd like to talk about that calmly",
+      "her: ok. which part",
+      "me: I don't think I ignored you. I think I was tired and I handled it badly",
+      "her: it felt like you ignored me",
+      "me: that makes sense. thank you for telling me",
+      "her: I'm sorry too. I said things I didn't mean",
+      "me: thank you. which things",
+      "her: that you don't care. you do",
+      "me: I do. I just show it quietly",
+      "her: I know",
+      "me: want to start over with dinner",
+      "her: yes",
+      "me: I'm already booking it"
+    ],
+    "nar": [
+      "We both waited for the other to say sorry. I went first.",
+      "Two days of cold shoulders.",
+      "Pride was in the room.",
+      "I wanted to see what she was really doing.",
+      "I apologized for my part.",
+      "She didn't expect that.",
+      "I kept my point, calmly.",
+      "She heard me.",
+      "She apologized too.",
+      "Pride lost. We won."
+    ],
+    "caption": "we both waited for the other to say sorry. @plug_ai helped me go first without giving up my point"
   }
 ];
 
